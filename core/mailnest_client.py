@@ -77,12 +77,13 @@ def _request(method: str, path: str, *, params: dict | None = None, json: dict |
 
 
 def pick_account() -> MailNestAccount:
-    """购买/领取一个 MailNest 临时邮箱并缓存上下文。"""
-    project_code = _project_code()
+    """购买一个 MailNest 独占邮箱并缓存上下文。"""
+    # 保留 project_code 到账号上下文，兼容现有配置与调用；独占邮箱购买不依赖它。
+    project_code = str(getattr(_email_cfg, "MAIL_NEST_PROJECT_CODE", "") or "").strip()
     data = _request(
         "POST",
-        "/api/v1/email/temporary/buy",
-        json={"project_code": project_code, "count": 1},
+        "/api/v1/email/exclusive/buy",
+        json={"count": 1},
     )
     if not isinstance(data, list) or not data:
         raise MailNestClientError("MailNest 购买邮箱响应缺少 data[0]")
@@ -91,7 +92,7 @@ def pick_account() -> MailNestAccount:
         raise MailNestClientError("MailNest 购买邮箱响应缺少有效 email")
     account = MailNestAccount(email=email, project_code=project_code)
     _CONTEXT_CACHE[_cache_key(email)] = account
-    logger.info("[MailNest] 已获取临时邮箱: %s project_code=%s", email, project_code)
+    logger.info("[MailNest] 已获取独占邮箱: %s project_code=%s", email, project_code)
     return account
 
 
@@ -106,7 +107,7 @@ def get_account_context(email: str) -> MailNestAccount | None:
 
 def release_account(email: str, status: str = "available", note: str | None = None) -> None:
     _CONTEXT_CACHE.pop(_cache_key(email), None)
-    logger.info("[MailNest] 已释放临时邮箱: %s（status=%s, note=%s）", email, status, note or "")
+    logger.info("[MailNest] 已释放独占邮箱: %s（status=%s, note=%s）", email, status, note or "")
 
 
 def _get_mails(email: str):
