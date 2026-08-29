@@ -124,7 +124,7 @@ def _extract_callback_url_from_page(page) -> str:
         ) or []
         for url in urls:
             if _is_callback_url(str(url)):
-                logger.info("[Codex][BrowserUse] 已从页面性能记录提取 callback URL：%s", str(url)[:160])
+                logger.info("[Codex][BrowserUse] 已从页面性能记录提取 callback URL: path=%s", urlparse(str(url)).path)
                 return str(url)
     except Exception as exc:
         logger.debug("[Codex][BrowserUse] 提取 callback URL 失败：%s", exc)
@@ -156,7 +156,7 @@ def _wait_for_callback(context, page, timeout: int | None = None) -> str:
         try:
             current = str(page.url or "")
             if current != last_url:
-                logger.debug("[Codex][BrowserUse] 当前 URL: %s", current)
+                logger.debug("[Codex][BrowserUse] 当前 URL path=%s", urlparse(current).path)
                 last_url = current
             callback = _extract_callback_url_from_context(context, page)
             if callback:
@@ -803,7 +803,7 @@ def _fill_login_password_if_present(page, email: str, timeout: int = 18) -> str 
 def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_tracker: dict | None = None) -> None:
     otp_after_ts = time.time()
     logger.info("[Codex][BrowserUse] 打开授权地址")
-    logger.info("[Codex][BrowserUse] 完整授权地址: %s", auth_url)
+    logger.info("[Codex][BrowserUse] 授权地址 %s", _codex_proto._safe_oauth_url_summary(auth_url))
     _t_goto = _StepTimer("打开授权页")
     page.goto(auth_url, wait_until="domcontentloaded", timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
     try:
@@ -1490,7 +1490,7 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
             state = cpa_auth["state"]
             code_verifier = ""
         elif auth_source == "sub2":
-            sub2_auth = proto._request_sub2_authorize_url()
+            sub2_auth = proto._request_sub2_authorize_url(email=email)
             auth_url = sub2_auth["auth_url"]
             state = sub2_auth["state"]
             code_verifier = ""
@@ -1529,7 +1529,7 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
             callback_url = _finish_consent_workspace(context, page)
             _t_callback.done()
             code = proto._extract_code(callback_url, state)
-            logger.info("[Codex][BrowserUse] 已捕获 callback code：%s...", code[:24])
+            logger.info("[Codex][BrowserUse] 已捕获 callback code: %s", _codex_proto._safe_code_summary(code))
 
             if auth_source == "cpa":
                 submit_payload = proto._submit_cpa_callback(callback_url)
@@ -1556,6 +1556,8 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
                     callback_url,
                     session_id=(sub2_auth or {}).get("session_id", ""),
                     redirect_uri=(proto.parse_qs(proto.urlparse(auth_url or "").query).get("redirect_uri") or [""])[0],
+                    email=email, auth_url=auth_url,
+                    authorization_record_id=(sub2_auth or {}).get("authorization_record_id", ""),
                 )
                 file_path = proto._save_sub2_local_record(
                     email=email,

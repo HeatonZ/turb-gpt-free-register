@@ -57,6 +57,9 @@ SUB2_CODEX_AUTH_URL_PATH: str = "/api/v1/admin/openai/generate-auth-url"
 # sub2api 当前创建账号接口：POST /api/v1/admin/openai/create-from-oauth
 SUB2_CODEX_CALLBACK_PATH: str = "/api/v1/admin/openai/create-from-oauth"
 
+# Sub2API OAuth callback 提交重试次数。
+SUB2_CODEX_CALLBACK_SUBMIT_RETRIES: int = 10
+
 # 兼容旧配置：sub2 Codex API 鉴权 Token；为空时复用 SUB2API_API_KEY / SUB2API_API_TOKEN。
 SUB2_CODEX_API_TOKEN: str = ""
 
@@ -84,8 +87,11 @@ apply_env_overrides(globals(), {
     'SUB2_CODEX_API_BASE': 'str',
     'SUB2_CODEX_AUTH_URL_PATH': 'str',
     'SUB2_CODEX_CALLBACK_PATH': 'str',
+    'SUB2_CODEX_CALLBACK_SUBMIT_RETRIES': 'int',
     'SUB2_CODEX_API_TOKEN': 'str',
     'SUB2_CODEX_AUTH_HEADER': 'str',
     'SUB2_CODEX_AUTH_PREFIX': 'str',
     'SUB2_CODEX_CALLBACK_PAYLOAD_MODE': 'str',
+    # 让 sub2api create-from-oauth 换 token 时走的代理（proxy id 或代理名），绕开地区校验
+    'SUB2_CODEX_PROXY_ID': 'str',
 })

@@ -540,6 +540,14 @@ EDITABLE_FIELDS = [
         "key": "SUB2API_PROXY_KEY", "file": "sub2api.py", "type": "str", "group": "Codex",
         "label": "Agent sub2 代理键", "help": "可选；写入 account.proxy_key，并在 proxies 为空时初始化 proxies[0].proxy_key",
     },
+    {
+        "key": "SUB2_CODEX_PROXY_ID", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 OAuth 换 token 代理 id", "help": "可选；create-from-oauth 时让 sub2api 用指定代理去 OpenAI 换 token（绕开 unsupported_country_region_territory）。填 sub2api 后台的代理 id（如 self1 的 23）",
+    },
+    {
+        "key": "SUB2_CODEX_CALLBACK_SUBMIT_RETRIES", "file": "sub2api.py", "type": "int", "group": "Codex",
+        "label": "Sub2API OAuth callback 提交重试次数", "help": "Sub2API OAuth callback 提交重试次数",
+    },
     # ---- 接码平台 ----
     # ---- Codex：基础 / CPA / sub2api 配置 ----
     {

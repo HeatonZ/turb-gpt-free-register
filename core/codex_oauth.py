@@ -49,6 +49,7 @@ from core.openai_auth import (
 )
 from core import db
 from core import sms_provider
+from core import sub2_oauth_recovery
 from curl_cffi import requests as curl_requests
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,10 @@ _MAX_REDIRECTS = 15
 # 网络层临时性错误（代理抖动 / TLS 握手失败 / 重置）重试参数，对齐 openai_auth.follow_authorize
 _NET_MAX_ATTEMPTS = 3
 _NET_BACKOFF_BASE = 2.0
+
+
+class _Sub2LedgerReconcileError(RuntimeError):
+    """Remote callback succeeded, but durable acknowledgement needs repair."""
 
 
 def _with_net_retry(label: str, fn):
@@ -337,7 +342,7 @@ def _sub2_codex_request_json(method: str, path: str, body: dict | None = None) -
             pass
 
 
-def _request_sub2_authorize_url() -> dict:
+def _request_sub2_authorize_url(email: str = "") -> dict:
     """从 sub2 生成 Codex OAuth 授权地址；本地不生成 PKCE。"""
     from config import sub2api as _sub2_cfg
     path = str(getattr(_sub2_cfg, "SUB2_CODEX_AUTH_URL_PATH", "/api/v1/admin/openai/generate-auth-url") or "/api/v1/admin/openai/generate-auth-url")
@@ -361,11 +366,18 @@ def _request_sub2_authorize_url() -> dict:
         raise RuntimeError(f"[Codex][sub2] sub2 未返回有效 auth_url: {payload}")
     if not state:
         raise RuntimeError("[Codex][sub2] 授权地址缺少 state")
-    logger.info("[Codex][sub2] 已获取授权地址，state=%s...", state[:12])
-    logger.info("[Codex][sub2] 完整授权地址: %s", auth_url)
+    logger.info("[Codex][sub2] 已获取授权地址，endpoint=%s path=%s state_fp=%s", _sub2_codex_base(), path, hashlib.sha256(state.encode()).hexdigest()[:8])
+    # auth_url/session_id are recovery material, never log them.
+    row = None
+    if email:
+        row = sub2_oauth_recovery.save_pending_authorization(
+            directory=sub2_oauth_recovery.ledger_dir(_PROJECT_ROOT, _cfg.CODEX_OUTPUT_DIRNAME),
+            email=email, auth_url=auth_url, session_id=session_id, state=state,
+            redirect_uri=(parse_qs(urlparse(auth_url).query).get("redirect_uri") or [""])[0],
+            endpoint=_sub2_codex_base(), path=path)
     if not session_id:
         logger.warning("[Codex][sub2] 授权地址响应缺少 session_id，后续 exchange-code 可能失败")
-    return {"auth_url": auth_url, "state": state, "session_id": session_id, "origin": _sub2_codex_base(), "raw": payload}
+    return {"auth_url": auth_url, "state": state, "session_id": session_id, "authorization_record_id": row.get("record_id", "") if email else "", "origin": _sub2_codex_base(), "raw": payload}
 
 
 def _summarize_sub2_response(payload: dict) -> str:
@@ -388,8 +400,36 @@ def _summarize_sub2_response(payload: dict) -> str:
     return str(payload)[:300]
 
 
-def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_uri: str = "") -> dict:
-    """提交 OAuth callback 给 sub2。"""
+def _resolve_sub2_proxy_id_by_name(name: str):
+    """按名字从 sub2api 查代理 id（用于把代理名解析成 *int64）。
+    找不到返回 None，出错返回 None。"""
+    from config import sub2api as _sub2_cfg
+    try:
+        resp = _sub2_codex_request_json("GET", "/api/v1/admin/proxies?page=1&page_size=200")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Codex][sub2] 查询代理列表失败，无法解析代理名：%s", exc)
+        return None
+    items = []
+    if isinstance(resp, dict):
+        data = resp.get("data")
+        if isinstance(data, dict):
+            items = data.get("items") or []
+        elif isinstance(data, list):
+            items = data
+    target = str(name or "").strip().lower()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("name") or "").strip().lower() == target:
+            try:
+                return int(item.get("id"))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_uri: str = "", email: str = "", auth_url: str = "", recovery_path: Path | None = None, authorization_record_id: str = "") -> dict:
+    """提交 callback, persisting replay material before network I/O."""
     from config import sub2api as _sub2_cfg
     path = str(getattr(_sub2_cfg, "SUB2_CODEX_CALLBACK_PATH", "/api/v1/admin/openai/create-from-oauth") or "/api/v1/admin/openai/create-from-oauth")
     mode = str(getattr(_sub2_cfg, "SUB2_CODEX_CALLBACK_PAYLOAD_MODE", "create_from_oauth") or "create_from_oauth").strip().lower()
@@ -405,35 +445,94 @@ def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_u
         if not session_id:
             raise RuntimeError("[Codex][sub2] exchange-code 缺少 session_id")
         if not code:
-            raise RuntimeError(f"[Codex][sub2] callback_url 缺少 code: {callback_url}")
+            raise RuntimeError("[Codex][sub2] callback_url 缺少 code")
         if not state:
-            raise RuntimeError(f"[Codex][sub2] callback_url 缺少 state: {callback_url}")
+            raise RuntimeError("[Codex][sub2] callback_url 缺少 state")
         body = {"session_id": session_id, "code": code, "state": state}
         if redirect_uri:
             body["redirect_uri"] = redirect_uri
         if mode in {"create_from_oauth", "create-from-oauth", "create_oauth_account"}:
             body.setdefault("concurrency", 3)
             body.setdefault("priority", 50)
+            # 可选：让 sub2api 用指定的代理去 OpenAI 换 token（绕开 unsupported_country_region_territory）
+            # 取值：SUB2_CODEX_PROXY_ID（sub2api 的 proxy id，整数）；也兼容“代理名”。
+            proxy_id_raw = str(
+                getattr(
+                    _sub2_cfg,
+                    "SUB2_CODEX_PROXY_ID",
+                    "",
+                )
+                or ""
+            ).strip()
+            if proxy_id_raw:
+                if proxy_id_raw.isdigit():
+                    body["proxy_id"] = int(proxy_id_raw)
+                else:
+                    # sub2api 的 proxy_id 字段是 *int64，不接受字符串名。
+                    # 尝试把代理名解析成 id，失败则不指定（避免 binding 报错）。
+                    pid = _resolve_sub2_proxy_id_by_name(proxy_id_raw)
+                    if pid is not None:
+                        body["proxy_id"] = pid
+                    else:
+                        logger.warning(
+                            "[Codex][sub2] SUB2_CODEX_PROXY_ID=%r 不是数字也未匹配到 sub2api 代理，忽略",
+                            proxy_id_raw,
+                        )
+                logger.info("[Codex][sub2] create-from-oauth 指定 proxy_id=%s", body.get("proxy_id"))
 
-    max_attempts = max(1, int(getattr(_cfg, "CPA_CALLBACK_SUBMIT_RETRIES", 5) or 5))
+    if email and auth_url and mode not in {"callback_url", "redirect_url"} and recovery_path is None:
+        directory = sub2_oauth_recovery.ledger_dir(_PROJECT_ROOT, _cfg.CODEX_OUTPUT_DIRNAME)
+        row = sub2_oauth_recovery.save_pending_callback(directory=directory, email=email, auth_url=auth_url, session_id=session_id, callback_url=callback_url, state=state, redirect_uri=redirect_uri, endpoint=_sub2_codex_base(), path=path, payload=body, authorization_record_id=authorization_record_id or sub2_oauth_recovery.record_id(session_id, state=state, path=path))
+        recovery_path = directory / f"{row['record_id']}.json"
+
+    max_attempts = max(1, int(getattr(_sub2_cfg, "SUB2_CODEX_CALLBACK_SUBMIT_RETRIES", 10) or 10))
     base_delay = max(1.0, float(getattr(_cfg, "CPA_CALLBACK_SUBMIT_RETRY_DELAY", 6) or 6))
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
-            logger.info("[Codex][sub2] 正在上传 OAuth callback（第 %s/%s 次）... callback=%s", attempt, max_attempts, callback_url)
+            logger.info("[Codex][sub2] 正在上传 OAuth callback（第 %s/%s 次）...", attempt, max_attempts)
             payload = _sub2_codex_request_json("POST", path, body)
+            if recovery_path is not None:
+                try:
+                    sub2_oauth_recovery.update_record(recovery_path, attempts=attempt, sub2_submit_response=payload, status="succeeded")
+                except Exception as ledger_exc:
+                    # A 2xx is not a retryable submission failure.  Best-effort
+                    # reconciliation must happen outside the network retry handler.
+                    try:
+                        sub2_oauth_recovery.update_record(recovery_path, attempts=attempt, sub2_submit_response=payload, status="needs_reconcile", last_error="ledger update failed")
+                    except Exception:
+                        logger.error("[Codex][sub2] callback 已收到 2xx，但账本写回和 needs_reconcile 标记均失败：%s", type(ledger_exc).__name__)
+                    raise _Sub2LedgerReconcileError() from ledger_exc
             logger.info("[Codex][sub2] callback 已上传并处理完成（第 %s 次成功）响应=%s", attempt, _summarize_sub2_response(payload))
             return payload
+        except _Sub2LedgerReconcileError:
+            # Never turn a successful remote create into a pending retry.
+            raise
         except Exception as exc:
             last_exc = exc
+            if recovery_path is not None:
+                try:
+                    sub2_oauth_recovery.update_record(recovery_path, attempts=attempt, status="pending", last_error=f"{type(exc).__name__}: {str(exc)[:240]}")
+                except Exception:
+                    logger.error("[Codex][sub2] callback 失败，但账本状态写回失败：%s", type(exc).__name__)
             retryable = _is_cpa_callback_retryable(exc)
             if attempt >= max_attempts or not retryable:
-                logger.warning("[Codex][sub2] callback 上传失败且不再重试：attempt=%s/%s retryable=%s error=%s", attempt, max_attempts, retryable, exc)
+                logger.warning("[Codex][sub2] callback 上传失败且不再重试：attempt=%s/%s retryable=%s error=%s", attempt, max_attempts, retryable, type(exc).__name__)
                 raise
             delay = base_delay * attempt
             logger.warning("[Codex][sub2] callback 上传失败，将在 %.1fs 后重试：attempt=%s/%s error=%s", delay, attempt, max_attempts, exc)
             time.sleep(delay)
     raise RuntimeError(f"[Codex][sub2] callback 上传失败：{last_exc}")
+
+
+def retry_sub2_recovery(path: str | Path) -> dict:
+    """Retry an existing ledger callback only; never re-authorizes or invokes OTP/browser."""
+    ledger = Path(path)
+    row = sub2_oauth_recovery.load_record(ledger)
+    if row.get("status") not in {"pending", "needs_reconcile"}:
+        return row
+    callback = "http://localhost:1455/auth/callback?" + urlencode({"code": row["code"], "state": row["state"]})
+    return _submit_sub2_callback(callback, session_id=row["session_id"], redirect_uri=row.get("redirect_uri", ""), email=row.get("email", ""), auth_url=row.get("auth_url", ""), recovery_path=ledger)
 
 
 
@@ -566,6 +665,22 @@ def _first_non_empty(*values) -> str:
     return ""
 
 
+def _safe_oauth_url_summary(value: str) -> str:
+    try:
+        parsed = urlparse(str(value or ""))
+        query = parse_qs(parsed.query)
+        state = (query.get("state") or [""])[0]
+        state_fp = hashlib.sha256(state.encode()).hexdigest()[:8] if state else "-"
+        return f"endpoint={parsed.netloc or '-'} path={parsed.path or '/'} state_fp={state_fp}"
+    except Exception:
+        return "endpoint=- path=- state_fp=-"
+
+
+def _safe_code_summary(code: str) -> str:
+    raw = str(code or "")
+    return f"len={len(raw)} fp={hashlib.sha256(raw.encode()).hexdigest()[:8]}"
+
+
 def _extract_state_from_auth_url(auth_url: str) -> str:
     try:
         return parse_qs(urlparse(auth_url).query).get("state", [""])[0]
@@ -599,8 +714,8 @@ def _request_cpa_authorize_url() -> dict:
         raise RuntimeError(f"[Codex][CPA] CPA 未返回有效 auth_url: {payload}")
     if not state:
         raise RuntimeError("[Codex][CPA] CPA 授权地址缺少 state")
-    logger.info(f"[Codex][CPA] 已获取授权地址，state={state[:12]}...")
-    logger.info(f"[Codex][CPA] 完整授权地址: {auth_url}")
+    logger.info("[Codex][CPA] 已获取授权地址 state_fp=%s", hashlib.sha256(state.encode()).hexdigest()[:8])
+    logger.info("[Codex][CPA] 授权地址 endpoint=%s path=%s state_fp=%s", urlparse(auth_url).netloc, urlparse(auth_url).path, hashlib.sha256(state.encode()).hexdigest()[:8])
     return {
         "auth_url": auth_url,
         "state": state,
@@ -654,8 +769,8 @@ def _submit_cpa_callback(callback_url: str) -> dict:
     for attempt in range(1, max_attempts + 1):
         try:
             logger.info(
-                "[Codex][CPA] 正在提交 OAuth callback 给 CPA（第 %s/%s 次）... callback=%s",
-                attempt, max_attempts, str(callback_url or "")
+                "[Codex][CPA] 正在提交 OAuth callback 给 CPA（第 %s/%s 次）... %s",
+                attempt, max_attempts, _safe_oauth_url_summary(callback_url)
             )
             payload = _cpa_request_json("POST", "/v0/management/oauth-callback", body)
             logger.info("[Codex][CPA] callback 已提交（第 %s 次成功）", attempt)
@@ -666,7 +781,7 @@ def _submit_cpa_callback(callback_url: str) -> dict:
             if attempt >= max_attempts or not retryable:
                 logger.warning(
                     "[Codex][CPA] callback 提交失败且不再重试：attempt=%s/%s retryable=%s error=%s",
-                    attempt, max_attempts, retryable, exc
+                    attempt, max_attempts, retryable, type(exc).__name__
                 )
                 raise
             delay = base_delay * attempt
@@ -807,12 +922,12 @@ def _bootstrap_authorize(
     auth_url = _ensure_oai_context_url(auth_url, session)
     headers = session.get_auth_navigate_headers(referer="https://chatgpt.com/")
     logger.info("[Codex] 跟随 Codex authorize URL 建立会话...")
-    logger.info(f"[Codex] 完整授权地址: {auth_url}")
+    logger.info("[Codex] 授权地址 endpoint=%s path=%s state_fp=%s", urlparse(auth_url).netloc, urlparse(auth_url).path, hashlib.sha256(state.encode()).hexdigest()[:8])
     resp = _with_net_retry(
         "bootstrap authorize",
         lambda: session.get(auth_url, headers=headers, allow_redirects=True),
     )
-    logger.debug(f"[Codex] authorize 落点: {getattr(resp, 'url', '')}, status={getattr(resp, 'status_code', '')}")
+    logger.debug("[Codex] authorize 落点 path=%s status=%s", urlparse(str(getattr(resp, "url", "") or "")).path, getattr(resp, "status_code", ""))
 
 
 # ============================================================
@@ -1082,7 +1197,7 @@ def _follow_until_callback(session: BrowserSession, url: str, state: str) -> str
         headers = session.get_auth_navigate_headers(referer="https://auth.openai.com/")
         resp = session.get(url, headers=headers, allow_redirects=False)
         loc = resp.headers.get("location") or resp.headers.get("Location")
-        logger.debug(f"[Codex] callback 跟随 hop {hop}: status={getattr(resp,'status_code','')}, location={loc}")
+        logger.debug("[Codex] callback 跟随 hop %s: status=%s location_path=%s", hop, getattr(resp, "status_code", ""), urlparse(loc).path if loc else "-")
         if loc is None:
             raise RuntimeError(
                 f"[Codex] 跟随中断，未命中 callback: url={url}, "
@@ -1417,12 +1532,12 @@ def run_codex_oauth(
             cpa_auth = _request_cpa_authorize_url()
             state = cpa_auth["state"]
             auth_url = cpa_auth["auth_url"]
-            logger.info(f"[Codex] 当前使用 CPA 授权地址: {auth_url}")
+            logger.info("[Codex] 当前使用 CPA 授权地址 endpoint=%s path=%s state_fp=%s", urlparse(auth_url).netloc, urlparse(auth_url).path, hashlib.sha256(state.encode()).hexdigest()[:8])
         elif auth_source == "sub2":
-            sub2_auth = _request_sub2_authorize_url()
+            sub2_auth = _request_sub2_authorize_url(email=email)
             state = sub2_auth["state"]
             auth_url = sub2_auth["auth_url"]
-            logger.info(f"[Codex] 当前使用 sub2 授权地址: {auth_url}")
+            logger.info("[Codex] 当前使用 sub2 授权地址 endpoint=%s path=%s state_fp=%s", urlparse(auth_url).netloc, urlparse(auth_url).path, hashlib.sha256(state.encode()).hexdigest()[:8])
         elif auth_source == "local":
             code_verifier, code_challenge = _generate_pkce()
             state = _generate_state()
@@ -1476,7 +1591,7 @@ def run_codex_oauth(
         # 6. 选 workspace → 拿 callback code
         callback_url = _select_workspace_and_get_callback(session, state)
         code = _extract_code(callback_url, state)
-        logger.info(f"[Codex] 已拿到 authorization code：{code[:24]}...")
+        logger.info("[Codex] 已拿到 authorization code: len=%s fp=%s", len(code), hashlib.sha256(code.encode()).hexdigest()[:8])
 
         # 7A. CPA 模式：把 callback URL 交给 CPA，由 CPA 持有 verifier 并完成换 token / 写 auth。
         #     本地不再用 code 换 token；仅保存 CPA 返回的授权文件或回调回执。
@@ -1506,6 +1621,8 @@ def run_codex_oauth(
                 callback_url,
                 session_id=(sub2_auth or {}).get("session_id", ""),
                 redirect_uri=(parse_qs(urlparse(auth_url or "").query).get("redirect_uri") or [""])[0],
+                email=email, auth_url=auth_url or "",
+                authorization_record_id=(sub2_auth or {}).get("authorization_record_id", ""),
             )
             path = _save_sub2_local_record(
                 email=email,

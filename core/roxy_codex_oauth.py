@@ -127,7 +127,7 @@ def _extract_callback_url_from_page(driver) -> str:
         """) or []
         for url in urls:
             if _is_callback_url(str(url)):
-                logger.info("[Codex][Browser] 已从浏览器性能记录提取 callback URL：%s", str(url)[:160])
+                logger.info("[Codex][Browser] 已从浏览器性能记录提取 callback URL: path=%s", urlparse(str(url)).path)
                 return str(url)
     except Exception as exc:
         logger.debug("[Codex][Browser] 从页面提取 callback URL 失败：%s", exc)
@@ -159,7 +159,7 @@ def _wait_for_callback(driver, timeout: int | None = None) -> str:
         try:
             current = str(driver.current_url or "")
             if current != last_url:
-                logger.debug("[Codex][Browser] 当前 URL: %s", current)
+                logger.debug("[Codex][Browser] 当前 URL path=%s", urlparse(current).path)
                 last_url = current
             callback = _extract_callback_url_from_any_window(driver)
             if callback:
@@ -376,7 +376,7 @@ def _fill_login_password_if_present(driver, email: str, timeout: int = 18) -> st
 def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None:
     otp_after_ts = time.time()
     logger.info("[Codex][Browser] 打开授权地址")
-    logger.info("[Codex][Browser] 完整授权地址: %s", auth_url)
+    logger.info("[Codex][Browser] 授权地址 %s", _codex_proto._safe_oauth_url_summary(auth_url))
     driver.get(auth_url)
     human_delay("navigate")
     logger.info("[Codex][Browser] 授权页加载完成，检查是否需要邮箱登录")
@@ -1420,17 +1420,17 @@ def _run_roxy_codex_oauth_once(
             cpa_auth = proto._request_cpa_authorize_url()
             state = cpa_auth["state"]
             auth_url = cpa_auth["auth_url"]
-            logger.info("[Codex][Browser] 当前使用 CPA 授权地址: %s", auth_url)
+            logger.info("[Codex][Browser] 当前使用 CPA 授权地址 %s", _codex_proto._safe_oauth_url_summary(auth_url))
         elif auth_source == "sub2":
-            sub2_auth = proto._request_sub2_authorize_url()
+            sub2_auth = proto._request_sub2_authorize_url(email=email)
             state = sub2_auth["state"]
             auth_url = sub2_auth["auth_url"]
-            logger.info("[Codex][Browser] 当前使用 sub2 授权地址: %s", auth_url)
+            logger.info("[Codex][Browser] 当前使用 sub2 授权地址 %s", _codex_proto._safe_oauth_url_summary(auth_url))
         elif auth_source == "local":
             code_verifier, code_challenge = proto._generate_pkce()
             state = proto._generate_state()
             auth_url = proto._build_authorize_url(state, code_challenge, prompt="login")
-            logger.info("[Codex][Browser] 当前使用本地 PKCE 授权地址: %s", auth_url)
+            logger.info("[Codex][Browser] 当前使用本地 PKCE 授权地址 %s", _codex_proto._safe_oauth_url_summary(auth_url))
         else:
             raise RuntimeError(f"[Codex][Browser] 不支持的 CODEX_AUTH_URL_SOURCE={auth_source!r}")
 
@@ -1449,7 +1449,7 @@ def _run_roxy_codex_oauth_once(
         logger.info("[Codex][Browser] 手机验证处理完成/无需处理，等待授权确认和 callback")
         callback_url = _finish_consent_workspace(driver)
         code = proto._extract_code(callback_url, state)
-        logger.info("[Codex][Browser] 已捕获 callback code：%s...", code[:24])
+        logger.info("[Codex][Browser] 已捕获 callback code: %s", _codex_proto._safe_code_summary(code))
 
         if auth_source == "cpa":
             submit_payload = proto._submit_cpa_callback(callback_url)
@@ -1475,6 +1475,8 @@ def _run_roxy_codex_oauth_once(
                 callback_url,
                 session_id=(sub2_auth or {}).get("session_id", ""),
                 redirect_uri=(proto.parse_qs(proto.urlparse(auth_url or "").query).get("redirect_uri") or [""])[0],
+                email=email, auth_url=auth_url,
+                authorization_record_id=(sub2_auth or {}).get("authorization_record_id", ""),
             )
             path = proto._save_sub2_local_record(
                 email=email,
