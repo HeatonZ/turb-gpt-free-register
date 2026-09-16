@@ -3,7 +3,7 @@
 注册后处理模块：
     1. 拉取 /api/auth/session，从中抽取 accessToken / user 信息
     2. 设置 2FA（TOTP），返回 secret
-    3. 把账号信息（邮箱 + accessToken + TOTP secret）落盘成 JSON
+    3. 把账号信息（邮箱 + accessToken + TOTP secret）保存到 SQLite
 
 整体复用注册阶段的 BrowserSession（同一 cookie jar / 同一 IP / 同一 UA），
 避免再起新会话被风控关联或缺失登录态。
@@ -14,7 +14,6 @@ import random
 import time
 from datetime import datetime
 from pathlib import Path
-import threading
 from urllib.parse import urlencode
 
 import pyotp
@@ -24,10 +23,161 @@ from core.humanize import delay as human_delay
 
 logger = logging.getLogger(__name__)
 
-# 输出目录（与项目根 .claude/ 工作区分离，单独放在 accounts/）
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_ACCOUNTS_DIR = _PROJECT_ROOT / "accounts"
-_BATCH_ARCHIVE_LOCK = threading.RLock()
+
+def _clear_twofa_session_circuit(
+    session: BrowserSession, *, source: str = "可选预热"
+) -> None:
+    """清理 2FA 可恢复步骤产生的熔断状态。
+
+    登录态 bootstrap 会访问若干非关键前端接口；其中任意一个接口的 403 都会
+    触发 BrowserSession 的通用熔断器。预热本身允许失败，因此不能让该熔断继续
+    拦截后面的正式重认证请求（尤其是 ``/api/auth/csrf``）。
+    """
+    blocked_reason = str(getattr(session, "blocked_reason", "") or "")
+    reset = getattr(session, "reset_circuit_breaker", None)
+    if callable(reset):
+        reset()
+    elif getattr(session, "blocked_until", 0.0):
+        # 兼容测试桩或旧版 BrowserSession。
+        session.blocked_until = 0.0
+        session.blocked_reason = ""
+    if blocked_reason:
+        logger.info("[2FA] 已清理%s产生的熔断状态：%s", source, blocked_reason)
+
+
+_RETRYABLE_REAUTH_HINTS = (
+    "403", "408", "425", "429", "500", "502", "503", "504",
+    "proxy", "socks", "timeout", "timed out", "connection", "closed",
+    "reset", "temporarily unavailable", "熔断冷却",
+)
+
+
+def _is_retryable_reauth_error(exc: BaseException) -> bool:
+    """仅重试限流、服务端错误和传输故障，不重试普通业务 4xx。"""
+    response = getattr(exc, "response", None)
+    try:
+        status = int(getattr(response, "status_code", 0) or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if status:
+        return status in (403, 408, 425, 429) or status >= 500
+    text = str(exc or "").lower()
+    return any(hint in text for hint in _RETRYABLE_REAUTH_HINTS)
+
+
+def _trigger_reauth_with_retry(session: BrowserSession, email: str) -> str:
+    """对 CSRF + signin 阶段的临时故障执行有限指数退避重试。"""
+    from config import twofa as _twofa_cfg
+
+    max_attempts = max(1, min(8, int(
+        getattr(_twofa_cfg, "TWOFA_REAUTH_MAX_ATTEMPTS", 3) or 3
+    )))
+    base_delay = max(0.0, min(60.0, float(
+        getattr(_twofa_cfg, "TWOFA_REAUTH_RETRY_DELAY", 3.0) or 0.0
+    )))
+    last_exc: BaseException | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            auth_url = _trigger_reauth(session, email)
+            if attempt > 1:
+                logger.info("[2FA] 重认证发起重试成功：attempt=%s/%s", attempt, max_attempts)
+            return auth_url
+        except Exception as exc:
+            last_exc = exc
+            retryable = _is_retryable_reauth_error(exc)
+            if attempt >= max_attempts or not retryable:
+                logger.warning(
+                    "[2FA] 重认证发起失败且不再重试：attempt=%s/%s retryable=%s error=%s: %s",
+                    attempt, max_attempts, retryable, type(exc).__name__, str(exc)[:200],
+                )
+                raise
+
+            # 403/429 已开启 BrowserSession 熔断；不清理会导致下一轮在本地直接失败。
+            _clear_twofa_session_circuit(session, source="重认证请求")
+            delay = min(120.0, base_delay * (2 ** (attempt - 1)))
+            logger.warning(
+                "[2FA] 重认证发起临时失败：attempt=%s/%s error=%s: %s；%.1fs 后重试",
+                attempt, max_attempts, type(exc).__name__, str(exc)[:200], delay,
+            )
+            if delay > 0:
+                time.sleep(delay)
+
+    assert last_exc is not None
+    raise last_exc
+
+
+def _follow_reauth_with_retry(session: BrowserSession, auth_url: str) -> str:
+    """重试跨站 authorize 导航；首个 403 下发的 CF Cookie 可供下一轮复用。"""
+    from config import twofa as _twofa_cfg
+
+    max_attempts = max(1, min(8, int(
+        getattr(_twofa_cfg, "TWOFA_REAUTH_MAX_ATTEMPTS", 3) or 3
+    )))
+    base_delay = max(0.0, min(60.0, float(
+        getattr(_twofa_cfg, "TWOFA_REAUTH_RETRY_DELAY", 3.0) or 0.0
+    )))
+
+    # 新建协议会话此前会从 ChatGPT 直接命中复杂 authorize URL，auth 域没有
+    # document/locale/CF Cookie 上下文。先用简单页面做 best-effort 预热；预热
+    # 和正式 authorize 仍严格复用同一个 BrowserSession/deviceId/Cookie Jar。
+    _warm_auth_document_for_reauth(session)
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = _follow_reauth(session, auth_url)
+            if attempt > 1:
+                logger.info("[2FA] authorize 导航重试成功：attempt=%s/%s", attempt, max_attempts)
+            return result
+        except Exception as exc:
+            retryable = _is_retryable_reauth_error(exc)
+            if attempt >= max_attempts or not retryable:
+                logger.warning(
+                    "[2FA] authorize 导航失败且不再重试：attempt=%s/%s retryable=%s error=%s: %s",
+                    attempt, max_attempts, retryable, type(exc).__name__, str(exc)[:200],
+                )
+                raise
+
+            # 403 响应通常会刷新 __cf_bm。清理本地熔断但保留 Cookie Jar，
+            # 下一轮继续使用同一 OAuth state 和新 Cookie 导航。
+            _clear_twofa_session_circuit(session, source="authorize 导航")
+            delay = min(120.0, base_delay * (2 ** (attempt - 1)))
+            logger.warning(
+                "[2FA] authorize 导航临时失败：attempt=%s/%s error=%s: %s；"
+                "%.1fs 后复用 CF Cookie 重试",
+                attempt, max_attempts, type(exc).__name__, str(exc)[:200], delay,
+            )
+            if delay > 0:
+                time.sleep(delay)
+
+    raise RuntimeError("authorize 导航重试耗尽")
+
+
+def _warm_auth_document_for_reauth(session: BrowserSession) -> None:
+    """预热 auth.openai.com 顶层文档；403 时保留新 Cookie 后有限重试。"""
+    get_headers = getattr(session, "get_auth_navigate_headers", None)
+    request_get = getattr(session, "get", None)
+    if not callable(get_headers) or not callable(request_get):
+        return
+    headers = get_headers(referer="", user_initiated=False)
+    for attempt in range(1, 3):
+        try:
+            resp = request_get(
+                "https://auth.openai.com/log-in",
+                headers=headers,
+                allow_redirects=True,
+            )
+            status = int(getattr(resp, "status_code", 0) or 0)
+            if status < 400:
+                logger.info("[2FA] Auth document 预热完成")
+                return
+            logger.info("[2FA] Auth document 预热返回 HTTP %s，保留响应 Cookie", status)
+        except Exception as exc:
+            logger.debug("[2FA] Auth document 预热异常：%s: %s", type(exc).__name__, str(exc)[:160])
+        _clear_twofa_session_circuit(session, source="Auth document 预热")
+        if attempt < 2:
+            time.sleep(float(attempt))
+    logger.info("[2FA] Auth document 预热未通过，继续正式 authorize 重试链")
 
 
 def _post_register_dwell_seconds() -> float:
@@ -113,26 +263,9 @@ def _account_copy_line(
     return "----".join(parts)
 
 
-def create_batch_archive_dir(count: int, workers: int = 1) -> Path:
-    """为一次运行创建批次归档目录，例如 accounts/20260509-10个-3线程。"""
-    day = datetime.now().strftime("%Y%m%d")
-    base_name = f"{day}-{count}个" if workers <= 1 else f"{day}-{count}个-{workers}线程"
-    folder = _ACCOUNTS_DIR / base_name
-    suffix = 2
-    while folder.exists():
-        folder = _ACCOUNTS_DIR / f"{base_name}-{suffix}"
-        suffix += 1
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "注册成功的邮箱.txt").write_text("", encoding="utf-8")
-    (folder / "注册成功的token.txt").write_text("", encoding="utf-8")
-    (folder / "注册成功整行.txt").write_text("", encoding="utf-8")
-    (folder / "注册成功账号.json").write_text("[]\n", encoding="utf-8")
-    return folder
-
-
-def _append_line(path: Path, line: str) -> None:
-    with path.open("a", encoding="utf-8", newline="\n") as f:
-        f.write(line + "\n")
+def create_batch_archive_dir(count: int, workers: int = 1) -> None:
+    """兼容旧调用方；批次数据现在直接保存到 SQLite，不创建归档目录。"""
+    return None
 
 
 def _append_batch_archive(
@@ -145,50 +278,12 @@ def _append_batch_archive(
     proxy_used: str | None,
     extra: dict,
     batch_dir: Path | None,
-) -> Path:
-    """把注册成功账号追加到本次批次目录的 TXT/JSON 文件中。"""
+) -> None:
+    """兼容旧调用方；注册账号已经由 db.insert_account 保存到 SQLite。"""
     from core import db
-
-    folder = batch_dir or create_batch_archive_dir(count=1)
-    row = db.get_account(row_id) or {}
-    folder.mkdir(parents=True, exist_ok=True)
-    material_line = _account_material_line(email, row)
-    try:
-        extra_raw = row.get("extra_json")
-        extra = json.loads(extra_raw) if isinstance(extra_raw, str) and extra_raw.strip() else (extra_raw if isinstance(extra_raw, dict) else {})
-        gpt_password = str((extra or {}).get("registration_password") or row.get("registration_password") or "").strip() or "未设置"
-    except Exception:
-        gpt_password = str(row.get("registration_password") or "").strip() or "未设置"
-    copy_line = _account_copy_line(material_line, access_token, gpt_password, totp_secret)
-    archive = {
-        "id": row_id,
-        "email": email,
-        "email_source": email_source,
-        "proxy_used": proxy_used,
-        "access_token": access_token,
-        "totp_secret": totp_secret,
-        "material_line": material_line,
-        "copy_line": copy_line,
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
-        "row": row,
-        "extra": extra,
-    }
-
-    with _BATCH_ARCHIVE_LOCK:
-        _append_line(folder / "注册成功的邮箱.txt", material_line)
-        _append_line(folder / "注册成功的token.txt", access_token)
-        _append_line(folder / "注册成功整行.txt", copy_line)
-
-        json_path = folder / "注册成功账号.json"
-        try:
-            rows = json.loads(json_path.read_text(encoding="utf-8")) if json_path.exists() else []
-        except Exception:
-            rows = []
-        if not isinstance(rows, list):
-            rows = []
-        rows.append(archive)
-        json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return folder
+    # 参数保留是为了兼容注册驱动；不再读取 batch_dir 或写入任何归档文件。
+    _ = (db, row_id, email, access_token, totp_secret, email_source, proxy_used, extra, batch_dir)
+    return None
 
 
 def follow_oauth_callback(session: BrowserSession, continue_url: str, referer: str = "https://auth.openai.com/about-you") -> str:
@@ -296,7 +391,7 @@ def _trigger_reauth(session: BrowserSession, email: str) -> str:
     return auth_url
 
 
-def _follow_reauth(session: BrowserSession, auth_url: str) -> None:
+def _follow_reauth(session: BrowserSession, auth_url: str) -> str:
     """
     步骤3: 跟随 authorize URL 触发邮箱 OTP 发送。
     auth.openai.com 会重定向到 /email-verification 页面，期间发送 OTP 邮件。
@@ -304,7 +399,9 @@ def _follow_reauth(session: BrowserSession, auth_url: str) -> None:
     headers = session.get_auth_navigate_headers(referer="https://chatgpt.com/")
     logger.info("[2FA] 跟随 authorize URL，触发 OTP 发送...")
     resp = session.get(auth_url, headers=headers, allow_redirects=True)
+    resp.raise_for_status()
     logger.info(f"[2FA] 落点 URL: {resp.url}")
+    return str(getattr(resp, "url", "") or "")
 
 
 def _validate_reauth_otp(session: BrowserSession, code: str) -> str:
@@ -437,14 +534,18 @@ def setup_2fa(
             logger.info("[2FA] accessToken 预热完成")
         except Exception as exc:
             logger.warning("[2FA] accessToken 预热失败，继续按重认证流程执行：%s: %s", type(exc).__name__, str(exc)[:180])
+        finally:
+            # authenticated_bootstrap(strict=False) 是可选预热。其非关键接口返回
+            # 403 时会开启会话级熔断，若不清理，下一步 CSRF 请求甚至不会发出。
+            _clear_twofa_session_circuit(session, source="可选预热")
 
     # 阶段一：重认证
     logger.info("[2FA] 阶段1：发起重认证")
     reauth_otp_after_ts = time.time()
-    auth_url = _trigger_reauth(session, email)
+    auth_url = _trigger_reauth_with_retry(session, email)
     logger.info("[2FA] 重认证 authorize URL 已获取")
     human_delay("api")
-    _follow_reauth(session, auth_url)
+    _follow_reauth_with_retry(session, auth_url)
     logger.info("[2FA] 已跟随重认证 authorize URL")
     human_delay("navigate")
 
@@ -518,11 +619,32 @@ def save_account_data(
     auto_plan_check: bool | None = None,
 ) -> int:
     """
-    将账号信息保存到本地 JSON/TXT 文件存储。
+    将账号信息保存到 SQLite；output_path 仅为兼容旧调用方保留。
     返回新插入/更新的 row id。
     """
     from core.db import insert_account
-    extra = extra or {}
+    extra = dict(extra or {})
+    # Remail 的 service token 只存在进程内上下文中。注册成功后把订单上下文
+    # 一并保存到账号 extra_json，服务重启时查活即可恢复，不再依赖“同一进程
+    # 中先领取邮箱”。普通账号列表不会返回 extra_json。
+    if str(email_source or "").strip().lower() == "remail":
+        try:
+            from core.remail_client import get_account_context_metadata
+
+            remail_metadata = get_account_context_metadata(email)
+            if remail_metadata:
+                existing_service = extra.get("email_service")
+                merged_service = dict(existing_service) if isinstance(existing_service, dict) else {}
+                merged_service.update(remail_metadata)
+                extra["email_service"] = merged_service
+        except Exception as exc:
+            # 订单上下文保存失败不应让已经完成的注册失败；后续查活仍会
+            # 尝试用 API Key 按邮箱搜索 Remail 订单恢复凭证。
+            logger.warning(
+                "[Save] 保存 Remail 订单上下文失败，后续将尝试按邮箱恢复：%s: %s",
+                type(exc).__name__,
+                str(exc)[:180],
+            )
     user = extra.get("user") or {}
     account = extra.get("account") or {}
     # 从 extra.codex 抽出顶层 codex 状态/错误，方便 WebUI 直接读账号字段
@@ -556,8 +678,7 @@ def save_account_data(
         extra=extra,
         batch_dir=batch_dir,
     )
-    logger.info(f"[Save] 账号已写入 DB, id={row_id}, email={email}")
-    logger.info(f"[Save] 批次归档目录: {batch_folder}")
+    logger.info("[Save] 账号及凭证已保存到 SQLite, id=%s, email=%s", row_id, email)
 
     auto_twofa = False
     try:

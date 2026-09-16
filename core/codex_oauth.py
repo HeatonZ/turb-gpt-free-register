@@ -16,8 +16,8 @@
        workspace_id 从 oai-client-auth-session cookie（base64 解码）的 workspaces[0].id 取
     6. → 重定向 localhost:1455/auth/callback?code=ac_...，从 Location 抠 code
 
-拿到 code 后换 token / 落盘的逻辑（exchange_codex_token / build_codex_storage /
-save_codex_credential）沿用旧实现，未改动。
+拿到 code 后换 token / 保存到 SQLite 的逻辑（exchange_codex_token /
+build_codex_storage / save_codex_credential）沿用原流程。
 """
 import base64
 import hashlib
@@ -26,6 +26,7 @@ import logging
 import random
 import secrets
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs, quote
@@ -40,12 +41,13 @@ from core.session import BrowserSession
 from core.humanize import delay as human_delay
 from core.openai_auth import (
     _is_transient_network_error,
+    _is_retryable_authorize_error,
+    _reset_retryable_circuit,
     _extract_error_code,
     detect_account_unusable_response_body,
     AccountUnusableError,
     request_sentinel_token,
     build_sentinel_header,
-    network_preflight,
 )
 from core import db
 from core import sms_provider
@@ -90,6 +92,55 @@ def _with_net_retry(label: str, fn):
             )
             time.sleep(backoff)
     raise last_exc if last_exc else RuntimeError(f"[Codex] {label} 重试耗尽但无异常记录")
+
+
+def _with_auth_navigation_retry(session: BrowserSession, label: str, fn):
+    """对 Auth document 的 403/429/5xx 重试，并保留当前 Cookie/设备上下文。"""
+    last_exc = None
+    for attempt in range(1, _NET_MAX_ATTEMPTS + 1):
+        try:
+            resp = fn()
+            status = int(getattr(resp, "status_code", 0) or 0)
+            if status >= 400:
+                error = RuntimeError(
+                    f"{label} status={status}, body={(getattr(resp, 'text', '') or '')[:180]}"
+                )
+                error.response = resp
+                raise error
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable_authorize_error(exc) or attempt >= _NET_MAX_ATTEMPTS:
+                raise
+            # Cloudflare 的 403 经常同时更新 __cf_bm。只清理本地熔断，绝不能
+            # 新建 Session，否则刚得到的 Cookie 和统一 device/session ID 会丢失。
+            _reset_retryable_circuit(session)
+            backoff = _NET_BACKOFF_BASE ** (attempt - 1)
+            logger.warning(
+                "[Codex] %s 临时失败（%s/%s）：%s: %s；"
+                "保留当前 session/deviceId/CF Cookie，%.1fs 后重试",
+                label, attempt, _NET_MAX_ATTEMPTS, type(exc).__name__,
+                str(exc)[:160], backoff,
+            )
+            time.sleep(backoff)
+    raise last_exc if last_exc else RuntimeError(f"[Codex] {label} 重试耗尽")
+
+
+def _codex_auth_preflight(session: BrowserSession) -> None:
+    """仅预热 Codex 真正依赖的 Auth 域名，不再用 ChatGPT 首页作为硬门槛。"""
+    headers = session.get_auth_navigate_headers(
+        referer="", user_initiated=False, target_origin="https://auth.openai.com",
+    )
+    logger.info("[Codex][预检] Auth document（统一 session/deviceId）")
+    _with_auth_navigation_retry(
+        session,
+        "auth document 预检",
+        lambda: session.get(
+            "https://auth.openai.com/log-in",
+            headers=headers,
+            allow_redirects=True,
+        ),
+    )
 
 
 def _codex_result(
@@ -920,10 +971,13 @@ def _bootstrap_authorize(
             raise RuntimeError("[Codex] 本地生成授权地址需要 code_challenge")
         auth_url = _build_authorize_url(state, code_challenge, prompt="login")
     auth_url = _ensure_oai_context_url(auth_url, session)
-    headers = session.get_auth_navigate_headers(referer="https://chatgpt.com/")
+    # Codex CLI/CPA 授权地址是用户从外部客户端直接打开的顶层导航，不是从
+    # chatgpt.com 页面点击而来。使用 sec-fetch-site:none 且不伪造 Referer。
+    headers = session.get_auth_navigate_headers(referer="", user_initiated=True)
     logger.info("[Codex] 跟随 Codex authorize URL 建立会话...")
     logger.info("[Codex] 授权地址 endpoint=%s path=%s state_fp=%s", urlparse(auth_url).netloc, urlparse(auth_url).path, hashlib.sha256(state.encode()).hexdigest()[:8])
-    resp = _with_net_retry(
+    resp = _with_auth_navigation_retry(
+        session,
         "bootstrap authorize",
         lambda: session.get(auth_url, headers=headers, allow_redirects=True),
     )
@@ -1307,17 +1361,19 @@ def _credential_file_name(email: str, plan_type: str) -> str:
     return f"codex-{email}-{plan}.json"
 
 
-def save_codex_credential(storage: dict, email: str, plan_type: str) -> Path:
-    """落盘到 {PROJECT_ROOT}/{CODEX_OUTPUT_DIRNAME}/codex-{email}.json。"""
-    out_dir = _PROJECT_ROOT / _cfg.CODEX_OUTPUT_DIRNAME
-    out_dir.mkdir(parents=True, exist_ok=True)
+def save_codex_credential(storage: dict, email: str, plan_type: str) -> str:
+    """保存 Codex 凭证到 SQLite，不创建本地文件。"""
     fname = _credential_file_name(email, plan_type)
-    path = out_dir / fname
-    path.write_text(
-        json.dumps(storage, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    return path
+    db.upsert_codex_credential(storage, fname)
+    return f"sqlite://codex_accounts/{fname}"
+
+
+def _save_codex_credential(email: str, storage: dict) -> str:
+    """BrowserUse 兼容入口：同样只保存到 SQLite。"""
+    plan = ""
+    if isinstance(storage, dict):
+        plan = storage.get("plan_type") or storage.get("chatgpt_plan_type") or ""
+    return save_codex_credential(storage, email, plan)
 
 
 def _extract_cpa_auth_json(payload: dict) -> dict | None:
@@ -1363,11 +1419,11 @@ def _save_cpa_local_record(
     auth_url: str,
     state: str,
     submit_payload: dict,
-) -> Path | None:
+) -> str | None:
     """
-    本地记录 CPA 授权结果：
+    在 SQLite 记录 CPA 授权结果：
       1) 如果 CPA 返回完整 auth json，保存为可用 codex-邮箱[-plan].json；
-      2) 否则按配置保存 callback 提交回执，便于追踪 CPA 侧授权文件。
+      2) 否则按配置保存 callback 提交回执，便于追踪 CPA 侧授权结果。
     """
     auth_json = _extract_cpa_auth_json(submit_payload)
     if auth_json:
@@ -1378,10 +1434,8 @@ def _save_cpa_local_record(
     if not bool(getattr(_cfg, "CPA_SAVE_CALLBACK_RECEIPT", True)):
         return None
 
-    out_dir = _PROJECT_ROOT / _cfg.CODEX_OUTPUT_DIRNAME
-    out_dir.mkdir(parents=True, exist_ok=True)
     safe_email = (email or "unknown").strip().replace("/", "_").replace("\\", "_")
-    path = out_dir / f"codex-{safe_email}-cpa-callback.json"
+    fname = f"codex-{safe_email}-cpa-callback.json"
     record = {
         "type": "codex_cpa_callback",
         "email": email,
@@ -1393,8 +1447,8 @@ def _save_cpa_local_record(
         "submitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "note": "授权地址由 CPA 生成；callback 已提交给 CPA。若 CPA 响应未包含 token，本文件为本地回执记录。",
     }
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return path
+    db.upsert_codex_credential(record, fname)
+    return f"sqlite://codex_accounts/{fname}"
 
 
 def _save_sub2_local_record(
@@ -1404,8 +1458,8 @@ def _save_sub2_local_record(
     auth_url: str,
     state: str,
     submit_payload: dict,
-) -> Path | None:
-    """本地记录 sub2 授权结果；若 sub2 返回完整 auth json，则保存为可用 codex 凭证。"""
+) -> str | None:
+    """在 SQLite 记录 sub2 授权结果；若返回完整 auth json，则保存为 Codex 凭证。"""
     auth_json = _extract_cpa_auth_json(submit_payload)
     if auth_json:
         effective_email = auth_json.get("email") or email
@@ -1415,10 +1469,8 @@ def _save_sub2_local_record(
     if not bool(getattr(_cfg, "CPA_SAVE_CALLBACK_RECEIPT", True)):
         return None
 
-    out_dir = _PROJECT_ROOT / _cfg.CODEX_OUTPUT_DIRNAME
-    out_dir.mkdir(parents=True, exist_ok=True)
     safe_email = (email or "unknown").strip().replace("/", "_").replace("\\", "_")
-    path = out_dir / f"codex-{safe_email}-sub2-callback.json"
+    fname = f"codex-{safe_email}-sub2-callback.json"
     try:
         sub2_origin = _sub2_codex_base()
     except Exception:
@@ -1434,8 +1486,8 @@ def _save_sub2_local_record(
         "submitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "note": "授权地址由 sub2 生成；callback 已上传给 sub2。若 sub2 响应未包含 token，本文件为本地回执记录。",
     }
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return path
+    db.upsert_codex_credential(record, fname)
+    return f"sqlite://codex_accounts/{fname}"
 
 
 # ============================================================
@@ -1517,9 +1569,18 @@ def run_codex_oauth(
     if otp_provider is None:
         from core.email_provider import wait_for_otp as otp_provider
 
-    session = BrowserSession(proxy=proxy, fingerprint_seed=f"account:{email.lower()}")
+    # 单次 Codex 授权全程统一身份；下一任务即使是同一账号也生成全新的隔离身份。
+    task_seed = f"codex-oauth:{email.lower()}:{uuid.uuid4()}"
+    session = BrowserSession(proxy=proxy, fingerprint_seed=task_seed)
     try:
         logger.info(f"[Codex] 开始授权（全新 session）：{email}")
+        logger.info(
+            "[Codex] 统一指纹上下文：device_id=%s oai_session_id=%s auth_session_logging_id=%s %s",
+            session.device_id,
+            session.oai_session_id,
+            session.auth_session_logging_id,
+            session.fingerprint_summary_text(),
+        )
 
         # 1. 授权地址
         #    默认由 CPA 生成（本地不生成 PKCE/state）；local 模式保留旧代码用于兼容。
@@ -1547,7 +1608,7 @@ def run_codex_oauth(
 
         # 2. 网络预检 + 建立会话。预检不携带邮箱，不触发 OTP；
         #    真正烧邮箱的 authorize/continue 只在预检成功后执行。
-        network_preflight(session)
+        _codex_auth_preflight(session)
         human_delay("navigate")
 
         _bootstrap_authorize(session, state, code_challenge, auth_url=auth_url)
