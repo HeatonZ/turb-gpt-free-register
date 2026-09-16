@@ -28,6 +28,7 @@ import secrets
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs, quote
 
 import pyotp
@@ -54,6 +55,8 @@ from core import sub2_oauth_recovery
 from curl_cffi import requests as curl_requests
 
 logger = logging.getLogger(__name__)
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # 跟重定向链时的最大跳数，防死循环
 _MAX_REDIRECTS = 15
