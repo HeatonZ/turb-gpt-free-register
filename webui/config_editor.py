@@ -1010,8 +1010,14 @@ def _format_env_value(value, vtype: str) -> str:
             value = value.strip().lower() in ("true", "1", "yes", "on", "y")
         return "True" if value else "False"
     if vtype == "int":
+        # 前端留空的可选数字字段会提交 null/""：写为空值 = 未配置，
+        # 读取端 env_value 对空值自动回落 config/*.py 默认值（与 .env.example 留空语义一致）。
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return ""
         return str(int(value))
     if vtype == "float":
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return ""
         return repr(float(value))
     if vtype == "list_str_multiline":
         lines = _normalize_config_value(value, vtype)
