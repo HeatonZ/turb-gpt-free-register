@@ -73,7 +73,13 @@ class EmailChangeTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertIs(used_session, second)
         self.assertEqual(post.call_count, 2)
-        new_session.assert_called_once_with(9, None, email="")
+        new_session.assert_called_once()
+        args = new_session.call_args
+        self.assertEqual(args.args[0], 9)
+        # 上游 08e2015 代理切换优化：允许 allow_excluded_fallback=True，
+        # 从代理池兜底选一个（不可能为空，因为 PROXY_POOL 非空）。
+        self.assertTrue(str(args.args[1] or "").startswith("http"))
+        self.assertEqual(args.kwargs.get("email"), "")
 
     def test_recent_login_reuses_live_check_full_login_flow(self):
         session = MagicMock()
@@ -130,11 +136,18 @@ class EmailChangeTests(unittest.TestCase):
         self.assertEqual(preflight.call_args_list[0].args[:2], (
             "old@example.com", "socks5://proxy.example:1080",
         ))
-        self.assertEqual(preflight.call_args_list[1].args[:2], ("old@example.com", ""))
-        self.assertEqual(preflight.call_args_list[1].kwargs["fingerprint_state"], {})
+        # 上游 08e2015 代理切换优化：失败后从代理池兜底选一个新出口（PROXY_POOL 非空），
+        # 不再退回直连；只有代理池为空才 route_proxy=""
+        self.assertEqual(preflight.call_args_list[1].args[0], "old@example.com")
+        self.assertTrue(str(preflight.call_args_list[1].args[1] or "").startswith("http"))
+        # 上游 08e2015：新路线保留账号级 fingerprint_state（seed/设备字段），不复用旧路线 Geo 画像
+        fs = preflight.call_args_list[1].kwargs["fingerprint_state"]
+        self.assertIsInstance(fs, dict)
+        self.assertEqual(fs.get("fingerprint_seed"), "account:old@example.com")
         proxy_session.session.close.assert_called_once_with()
         self.assertIs(login.call_args.args[0], direct_session)
-        self.assertTrue(any("独立直连兜底" in call.args[1] for call in append_log.call_args_list))
+        # 上游 08e2015：失败后走代理池自适应路线（不再有"独立直连兜底"文案）
+        self.assertTrue(any("代理池自适应路线" in call.args[1] for call in append_log.call_args_list))
 
     def test_post_change_live_check_reuses_current_session(self):
         session = MagicMock()
