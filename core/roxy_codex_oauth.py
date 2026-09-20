@@ -1448,6 +1448,17 @@ def _run_roxy_codex_oauth_once(
         _do_phone_verification_if_present(driver)
         logger.info("[Codex][Browser] 手机验证处理完成/无需处理，等待授权确认和 callback")
         callback_url = _finish_consent_workspace(driver)
+        callback_recovery_path = None
+        if auth_source == "sub2":
+            callback_recovery_path = proto._save_sub2_callback_capture(
+                callback_url,
+                session_id=(sub2_auth or {}).get("session_id", ""),
+                state=state,
+                redirect_uri=(proto.parse_qs(proto.urlparse(auth_url or "").query).get("redirect_uri") or [""])[0],
+                email=email,
+                auth_url=auth_url,
+                authorization_record_id=(sub2_auth or {}).get("authorization_record_id", ""),
+            )
         code = proto._extract_code(callback_url, state)
         logger.info("[Codex][Browser] 已捕获 callback code: %s", _codex_proto._safe_code_summary(code))
 

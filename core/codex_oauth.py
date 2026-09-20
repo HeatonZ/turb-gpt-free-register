@@ -476,6 +476,49 @@ def _resolve_sub2_proxy_id_by_name(name: str):
     return None
 
 
+def _save_sub2_callback_capture(
+    callback_url: str,
+    *,
+    session_id: str = "",
+    state: str = "",
+    redirect_uri: str = "",
+    email: str = "",
+    auth_url: str = "",
+    authorization_record_id: str = "",
+) -> Path | None:
+    """Capture callback replay material before any follow-up work."""
+    if _codex_auth_url_source() != "sub2":
+        return None
+    callback_url = str(callback_url or "").strip()
+    parsed = urlparse(callback_url)
+    query = parse_qs(parsed.query)
+    code = (query.get("code") or [""])[0]
+    state = str(state or (query.get("state") or [""])[0] or "").strip()
+    if not session_id or not code or not state:
+        raise RuntimeError("[Codex][sub2] 捕获 callback 缺少 session_id/code/state，未写入恢复账本")
+    from config import sub2api as _sub2_cfg
+    path = str(getattr(_sub2_cfg, "SUB2_CODEX_CALLBACK_PATH", "/api/v1/admin/openai/create-from-oauth") or "/api/v1/admin/openai/create-from-oauth")
+    payload = {"session_id": session_id, "code": code, "state": state}
+    if redirect_uri:
+        payload["redirect_uri"] = redirect_uri
+    directory = sub2_oauth_recovery.ledger_dir(_PROJECT_ROOT, _cfg.CODEX_OUTPUT_DIRNAME)
+    row = sub2_oauth_recovery.save_pending_callback(
+        directory=directory,
+        email=email,
+        auth_url=auth_url,
+        session_id=session_id,
+        callback_url=callback_url,
+        state=state,
+        redirect_uri=redirect_uri,
+        endpoint=_sub2_codex_base(),
+        path=path,
+        payload=payload,
+        authorization_record_id=authorization_record_id,
+    )
+    logger.info("[Codex][sub2] callback 已立即落盘，等待提交：record_id=%s", row.get("record_id", ""))
+    return directory / f"{row['record_id']}.json"
+
+
 def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_uri: str = "", email: str = "", auth_url: str = "", recovery_path: Path | None = None, authorization_record_id: str = "") -> dict:
     """提交 callback, persisting replay material before network I/O."""
     from config import sub2api as _sub2_cfg
@@ -579,7 +622,7 @@ def retry_sub2_recovery(path: str | Path) -> dict:
     row = sub2_oauth_recovery.load_record(ledger)
     if row.get("status") not in {"pending", "needs_reconcile"}:
         return row
-    callback = "http://localhost:1455/auth/callback?" + urlencode({"code": row["code"], "state": row["state"]})
+    callback = row.get("callback_url") or ("http://localhost:1455/auth/callback?" + urlencode({"code": row["code"], "state": row["state"]}))
     return _submit_sub2_callback(callback, session_id=row["session_id"], redirect_uri=row.get("redirect_uri", ""), email=row.get("email", ""), auth_url=row.get("auth_url", ""), recovery_path=ledger)
 
 

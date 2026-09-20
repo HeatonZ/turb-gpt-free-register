@@ -1528,6 +1528,17 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
             _t_callback = _StepTimer("等待 consent/workspace/callback")
             callback_url = _finish_consent_workspace(context, page)
             _t_callback.done()
+            callback_recovery_path = None
+            if auth_source == "sub2":
+                callback_recovery_path = proto._save_sub2_callback_capture(
+                    callback_url,
+                    session_id=(sub2_auth or {}).get("session_id", ""),
+                    state=state,
+                    redirect_uri=(proto.parse_qs(proto.urlparse(auth_url or "").query).get("redirect_uri") or [""])[0],
+                    email=email,
+                    auth_url=auth_url,
+                    authorization_record_id=(sub2_auth or {}).get("authorization_record_id", ""),
+                )
             code = proto._extract_code(callback_url, state)
             logger.info("[Codex][BrowserUse] 已捕获 callback code: %s", _codex_proto._safe_code_summary(code))
 

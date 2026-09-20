@@ -86,7 +86,7 @@ def save_pending_callback(*, directory: Path, email: str, auth_url: str,
     metadata = dict(payload or {})
     row = {"version": 1, "type": "sub2_oauth_recovery", "record_id": rid,
            "email": email, "auth_url": auth_url, "session_id": session_id,
-           "code": code, "state": state, "redirect_uri": redirect_uri,
+           "code": code, "callback_url": callback_url, "state": state, "redirect_uri": redirect_uri,
            "sub2_endpoint": endpoint, "sub2_path": path, "payload": metadata,
            "attempts": 0, "status": "pending", "created_at": created_at, "updated_at": now}
     _atomic_write(old_path, row)
